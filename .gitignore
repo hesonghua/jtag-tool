@@ -1,0 +1,4 @@
+__pycache__/
+*.o
+jtag_tool_host
+jtag_tool_dbg
