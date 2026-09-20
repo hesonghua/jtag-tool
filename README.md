@@ -134,36 +134,120 @@ jtag> resume
 ./jtag_tool --serve 9876       # custom port
 ```
 
-## Server Binary Protocol
+## Server Binary Protocol (API)
 
-Command port frame format:
+### Command Port (default :5555)
+
+**Frame format** (bidirectional):
 ```
-[seq:1][cmd:1][len:2 LE][payload:len]
+[seq:1][cmd:1][len:2 LE][payload:len bytes]
 ```
-Response: `cmd | 0x80`; errors: `0x7F` + text.
 
-| cmd | name | payload |
-|-----|------|---------|
-| 0x01 | PING | — |
-| 0x02 | CMD (text) | shell command line |
-| 0x03 | HALTINFO | — |
-| 0x04 | HALT | — |
-| 0x05 | RESUME | — |
-| 0x06 | STEP | [count:1] |
-| 0x07 | REG_READ | [sel:N] |
-| 0x08 | REG_WRITE | [sel:1][val:4] |
-| 0x09 | MEM_READ | [addr:4][width:1][count:2] |
-| 0x0A | MEM_WRITE | [addr:4][width:1][count:2]+data |
-| 0x0B | BP_ADD | [addr:4][len:1] |
-| 0x0C | BP_DEL | [addr:4 or FFFFFFFF] |
-| 0x0D | WP_ADD | [addr:4][len:4][acc:1] |
-| 0x0E | WP_DEL | [addr:4 or FFFFFFFF] |
-| 0x0F | BPS (list) | — |
-| 0x10 | SWO_TPIU | [traceclk:4][baud:4] |
-| 0x11 | SWO_STAT | — |
-| 0x12 | REPROBE | — |
+**Response**: `cmd | 0x80` with same `seq`. Errors: `0x7F` + human-readable text.
 
-SWO port delivers raw ITM bytes from IP FIFO every 800µs (1KB buffer).
+**Convenience**: `seq` auto-increments per connection; server echoes it back for request-response matching.
+
+#### Commands
+
+| cmd | name | request payload | response payload | description |
+|-----|------|----------------|-----------------|-------------|
+| 0x01 | PING | — | version string | Connection test / version query |
+| 0x02 | CMD | text line (≤200B) | text output | Execute any shell command (same as interactive) |
+| 0x03 | HALTINFO | — | [state:1][reason:1][pc:4] | Target status poll (read-clears DFSR) |
+| 0x04 | HALT | — | [pc:4] | Halt target, returns halt PC |
+| 0x05 | RESUME | — | — | Resume target (steps over bp if needed) |
+| 0x06 | STEP | [count:1] (1-16) | [pc:4] | Single-step N instructions (masks bp at current PC) |
+| 0x07 | REG_READ | [sel:1 × N] | [val:4 × N] | Read N core registers by selector ID |
+| 0x08 | REG_WRITE | [sel:1][val:4] | — | Write one core register |
+| 0x09 | MEM_READ | [addr:4][width:1][count:2] | raw bytes (count × width) | Read memory; width: 1/2/4/8 |
+| 0x0A | MEM_WRITE | [addr:4][width:1][count:2]+data | — | Write memory; width: 1/2/4/8 |
+| 0x0B | BP_ADD | [addr:4][len:1] | [comp:1] | Add FPB breakpoint (len 2 or 4); idempotent |
+| 0x0C | BP_DEL | [addr:4 or FFFFFFFF=all] | [removed:1] | Remove breakpoint |
+| 0x0D | WP_ADD | [addr:4][len:4][acc:1] | [comp:1] | Add DWT watchpoint (acc: 5=r 6=w 7=a) |
+| 0x0E | WP_DEL | [addr:4 or FFFFFFFF=all] | [removed:1] | Remove watchpoint |
+| 0x0F | BPS | — | [nb:1]([addr:4][len:1])× [nw:1]([addr:4][len:4][acc:1])× | List all breakpoints/watchpoints |
+| 0x10 | SWO_TPIU | [traceclk:4][baud:4] | [actual_baud:4] | Configure target ITM/TPIU + local SWO RX |
+| 0x11 | SWO_STAT | — | [cnt:2][ovr:1][fe:1] | SWO FIFO status (auto-clears sticky errors) |
+| 0x12 | REPROBE | — | "reconnected AP*n" / error text | Full SWD reconnect (recovery) |
+
+#### Register Selector IDs (for 0x07/0x08)
+
+| sel | register | sel | register | sel | register |
+|-----|----------|-----|----------|-----|----------|
+| 0-12 | r0-r12 | 13 | sp (msp) | 14 | lr |
+| 15 | pc | 16 | xpsr (flags) | 17 | msp |
+| 18 | psp | 20 | primask | 21 | basepri |
+| 22 | faultmask | 23 | control | | |
+
+#### HALTINFO reason codes
+
+| value | meaning |
+|-------|---------|
+| 0 | running (no halt) |
+| 1 | debug-request (manual halt) |
+| 2 | breakpoint (FPB hit) |
+| 3 | watchpoint (DWT hit) |
+| 4 | vector-catch |
+| 5 | external reset |
+
+#### Example: Read PC and registers in one batch
+
+```python
+import socket, struct
+
+sock = socket.create_connection(("board", 5555))
+seq = 0
+
+def xchg(cmd, payload=b""):
+    global seq
+    seq += 1
+    sock.sendall(bytes([seq & 0xFF, cmd, len(payload), 0]) + payload)
+    hdr = b""
+    while len(hdr) < 4: hdr += sock.recv(4 - len(hdr))
+    rlen = hdr[2] | hdr[3] << 8
+    body = b""
+    while len(body) < rlen: body += sock.recv(rlen - len(body))
+    return body
+
+# Halt
+pc_bytes = xchg(0x04)
+pc = struct.unpack("<I", pc_bytes)[0]
+
+# Read r0-r3 + pc + xpsr (6 registers)
+body = xchg(0x07, bytes([0, 1, 2, 3, 15, 16]))
+vals = struct.unpack("<6I", body)
+print(f"pc=0x{vals[4]:08x} xpsr=0x{vals[5]:08x} r0=0x{vals[0]:08x}")
+
+# Read 16 words from SRAM
+data = xchg(0x09, struct.pack("<IBH", 0x20000000, 4, 16))
+
+# Resume
+xchg(0x05)
+```
+
+### SWO Stream Port (default :5556)
+
+Raw byte stream from the SWO receiver IP FIFO, drained every 800µs.
+
+- **No framing** — just raw ITM/TPIU bytes (NRZ/UART decoded)
+- **Single client** — new connection replaces old (client replacement)
+- **TCP keepalive** enabled on server side (idle detection)
+- FIFO: 1KB in IP, auto-flushes on overrun
+
+#### Connecting
+```python
+swo = socket.create_connection(("board", 5556))
+while True:
+    data = swo.recv(4096)  # raw ITM bytes
+    if not data: break
+    parse_itm(data)
+```
+
+### Error Handling
+
+- All errors return `0x7F` + descriptive text (e.g., `"cmd 0x0B: FPB comparator full (6 units)"`)
+- After 8 consecutive command failures, server auto-reprobes the SWD connection
+- TCP connection loss → client should reconnect and re-send `SWO_TPIU` to reconfigure
 
 ## Files
 
