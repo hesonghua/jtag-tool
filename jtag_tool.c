@@ -46,6 +46,7 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #endif
+#include "target_port.h"
 
 /* ------------------------------------------------------------------ */
 /* 工具                                                                */
@@ -1105,7 +1106,7 @@ static int mem_write8(memap_t *m, uint64_t addr, uint32_t val)
 #define DCRSR   0xE000EDF4u
 #define DCRDR   0xE000EDF8u
 #define CPUID   0xE000ED00u
-#define DBGMCU_CR 0xE0042004u
+/* DBGMCU_CR → target_port.h */
 #define DBGKEY  0xA05F0000u
 #define S_REGRDY (1u << 16)
 #define S_HALT   (1u << 17)
@@ -2001,10 +2002,14 @@ static void ensure_dbgmcu(shell_t *sh)
 {
     if (sh->dbgmcu_done || !sh->dap_ok)
         return;
-    if (mem_write32(sh_mem(sh), DBGMCU_CR, 0x27u) == 0)
+#if TGT_HAS_DBGMCU
+    if (mem_write32(sh_mem(sh), TGT_DBGMCU_ADDR, TGT_DBGMCU_VALUE) == 0)
         sh->dbgmcu_done = 1;
     else
         dap_check_sticky(&sh->dap);
+#else
+    sh->dbgmcu_done = 1;  /* 无 DBGMCU 的芯片直接标记完成 */
+#endif
 }
 
 /* 全量重连 target：清 shell 粘滞标志（下次访问重建 SWD 连接/DP 上电/
@@ -2273,16 +2278,21 @@ static uint32_t core_swo_tpiu(shell_t *sh, uint32_t tclk, uint32_t baud)
     mem_write32(m, 0xE0000FB0u, 0xC5ACCE55u);      /* ITM LAR（CM3 无，写无害） */
     /* DBGMCU_CR: DBG_SLEEP|STOP|STANDBY + TRACE_IOEN——用户固件 WFI 睡眠时
      * 内核时钟不停，AP 访问才不会全部 WAIT（重启后固件常睡，实测踩坑） */
-    mem_write32(m, DBGMCU_CR, 0x27u);
+    #if TGT_HAS_DBGMCU
+    mem_write32(m, TGT_DBGMCU_ADDR, TGT_DBGMCU_VALUE);
+    #endif
     /* F1 目标：AFIO_MAPR SWJ_CFG=010 释放 PB3 给 TPIU（SWO 复用 JTDO 引脚，
      * 固件不做此重映射时 TPIU 出不了引脚，线上只见 SWD 轮询漏流）。
      * 必须先经过 000 再到 010：实测 SWO 输出会静默卡死（所有 trace 寄存器
      * 读回全对、CYCCNT 在走，但线上 idle 零字节），SWJ_CFG 循环一踢即活 */
-    if (mem_read32(m, 0x40010004u, &v) == 0) {
-        uint32_t mapr = v & ~(7u << 24);
-        mem_write32(m, 0x40010004u, mapr);              /* SWJ full：断开 SWO */
-        mem_write32(m, 0x40010004u, mapr | (2u << 24)); /* 接回 SWO */
+    #if TGT_HAS_AFIO
+    if (mem_read32(m, TGT_AFIO_MAPR_ADDR, &v) == 0) {
+        uint32_t mapr = v & ~(7u << TGT_SWJ_CFG_SHIFT);
+        mem_write32(m, TGT_AFIO_MAPR_ADDR, mapr);
+        mem_write32(m, TGT_AFIO_MAPR_ADDR,
+                    mapr | (TGT_SWJ_CFG_SWO << TGT_SWJ_CFG_SHIFT));
     }
+    #endif
     /* ITM TCR：ITMena|TSEna|TXENA|BusID=1（0x17 缺 TXENA；TSEna 跟固件
      * swotest 的 0x0001000B 一致——它超时重配会自己写回，不一致会打架；
      * ts 包也是 swo_web GTC 时间线的来源）。
