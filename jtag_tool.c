@@ -709,6 +709,20 @@ static int swd_acc(jtag_t *j, int ap, int reg, int rnw, uint32_t wdata,
         }
         if (ack != SWD_ACK_WAIT) {
             err("SWD ACK FAULT/非法 (ack=%d)，清 sticky", ack);
+            /* 诊断：dump 完整位流（dir=1 host 驱动；cap 为采样） */
+            fprintf(stderr, "DIAG n=%d hdr=", n);
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "%d%s", tdi[i],
+                        (i == 7 || i == 8 || i == 11 || i == 12) ? "|" : "");
+            fprintf(stderr, "\nDIAG dir=");
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "%d%s", dir[i],
+                        (i == 7 || i == 8 || i == 11 || i == 12) ? "|" : "");
+            fprintf(stderr, "\nDIAG cap=");
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "%d%s", cap[i],
+                        (i == 7 || i == 8 || i == 11 || i == 12) ? "|" : "");
+            fprintf(stderr, "\n");
             swd_acc_raw_abort(j);
             return -1;
         }
@@ -1535,6 +1549,7 @@ static dap_t *sh_dap(shell_t *sh)
         if (sh->swd ? swd_connect(&sh->jtag, &sh->dap) < 0
                     : dap_probe(&sh->dap, &sh->jtag) < 0)
             return NULL;
+        dp_write(&sh->dap, 0x0, 0x0000001Eu);  /* 对齐 openocd：DPIDR 后先清 sticky（ABORT W1C 位） */
         uint32_t cs;
         if (dap_powerup(&sh->dap, &cs) < 0)
             return NULL;
