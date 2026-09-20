@@ -3471,19 +3471,32 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         uint32_t addr = rd32le(p);
         int w = p[4];
         unsigned cnt = (unsigned)p[5] | ((unsigned)p[6] << 8);
-        if (w != 1 && w != 2 && w != 4)
+        if (w != 1 && w != 2 && w != 4 && w != 8)
             goto ebad;
         if (cnt == 0 || cnt * (unsigned)w > (unsigned)max)
             goto etoolong;
         for (unsigned k = 0; k < cnt; k++) {
-            uint32_t v;
-            int r = w == 4 ? mem_read32(m, addr + (uint64_t)w * k, &v) :
-                    w == 2 ? mem_read16(m, addr + (uint64_t)w * k, &v) :
-                             mem_read8(m, addr + (uint64_t)w * k, &v);
-            if (r < 0)
-                goto eio;
-            for (int b = 0; b < w; b++)
-                out[k * (unsigned)w + (unsigned)b] = (uint8_t)(v >> (8 * b));
+            uint64_t a = addr + (uint64_t)w * k;
+            if (w == 8) {
+                /* 8 字节：两次 32 位读合并（小端低字在前） */
+                uint32_t lo, hi;
+                if (mem_read32(m, a, &lo) < 0)
+                    goto eio;
+                if (mem_read32(m, a + 4, &hi) < 0)
+                    goto eio;
+                uint64_t v = (uint64_t)lo | ((uint64_t)hi << 32);
+                for (int b = 0; b < 8; b++)
+                    out[k * 8 + (unsigned)b] = (uint8_t)(v >> (8 * b));
+            } else {
+                uint32_t v;
+                int r = w == 4 ? mem_read32(m, a, &v) :
+                        w == 2 ? mem_read16(m, a, &v) :
+                                 mem_read8(m, a, &v);
+                if (r < 0)
+                    goto eio;
+                for (int b = 0; b < w; b++)
+                    out[k * (unsigned)w + (unsigned)b] = (uint8_t)(v >> (8 * b));
+            }
         }
         return (int)(cnt * (unsigned)w);
     }
