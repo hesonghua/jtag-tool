@@ -171,7 +171,40 @@ SWO port delivers raw ITM bytes from IP FIFO every 800µs (1KB buffer).
 |------|-------------|
 | `jtag_tool.c` | C implementation — the primary binary (~3800 lines) |
 | `jtag_tool.py` | Python reference implementation (~2000 lines) |
+| `target_port.h` | Target MCU porting layer (vendor-specific config) |
 | `Makefile` | Cross-compile + host check targets |
+
+## Target Compatibility
+
+### Works Out of the Box
+
+| Component | M3 | M4 | Why |
+|-----------|----|----|-----|
+| SWD/JTAG protocol | ✅ | ✅ | ADIv5 is ARM standard |
+| halt/resume/step | ✅ | ✅ | DHCSR/DFSR same |
+| Register read/write | ✅ | ✅ | DCRSR/DCRDR same |
+| Memory access (8/16/32/64-bit) | ✅ | ✅ | AHB-AP standard |
+| FPB breakpoints | ✅ | ✅ | rev1 encoding compatible |
+| DWT watchpoints | ✅ | ✅ | 4 comparators, same |
+| ITM/TPIU trace | ✅ | ✅ | ARM standard |
+| SWO receiver | ✅ | ✅ | Protocol identical |
+| FPU registers | N/A | ✅ | Only integer regs accessed |
+
+### Porting Layer (`target_port.h`)
+
+Vendor-specific configuration is isolated in a single file:
+
+| Setting | STM32F1 (current) | GD32F1/CH32F1 | STM32F4/L4/H7 | NXP LPC |
+|---------|-------------------|---------------|---------------|---------|
+| DBGMCU | `0xE0042004`, `0x27` | Same (clone) | Same addr, check bits | Not needed (`TGT_HAS_DBGMCU=0`) |
+| SWO pin mux | AFIO_MAPR + SWJ_CFG | Same (clone) | GPIO AFR mechanism | Default active (`TGT_HAS_AFIO=0`) |
+
+**To port**: edit `target_port.h` only. Core code (`jtag_tool.c`) needs zero changes.
+
+### M4 Bonus
+
+DWT `POSTPRESET` is programmable on M4 (fixed ~1024 on M3), enabling
+higher PC sampling rates (~280K/s vs ~70K/s at 72MHz).
 
 ## Hardware Requirements
 
