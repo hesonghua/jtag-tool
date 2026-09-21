@@ -3310,7 +3310,7 @@ static int srv_listener(int port)
 #define BIN_REPROBE   0x12
 #define BIN_VREF      0x13
 #define BIN_ERR       0x7F
-#define BIN_MAXPL     4096
+#define BIN_MAXPL     16384
 
 /* CMD(0x02)：经 pipe 捕获 execute 的 printf 输出（单线程，命令结束后
  * 一次性读干；F_SETPIPE_SZ 提到 1MB 防 dump 类大输出中途塞死管道） */
