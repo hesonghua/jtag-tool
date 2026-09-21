@@ -3329,9 +3329,14 @@ static int srv_text_out(shell_t *sh, const char *line, uint8_t *out,
     fflush(stdout);
     dup2(saved, 1);
     close(saved);
-    int n = read(pfd[0], out, max);
+    /* 循环读到 EOF：写端已全关（fd1 已恢复），单次 read 理论上也能拿全，
+     * 但 pipe 数据分块到达时防御性循环更稳（且未来 execute 若 fork 子进程
+     * 继承写端，单次 read 会短读甚至提前返回空） */
+    int n = 0, r;
+    while (n < max && (r = (int)read(pfd[0], out + n, (size_t)(max - n))) > 0)
+        n += r;
     close(pfd[0]);
-    return n < 0 ? 0 : n;
+    return n;
 }
 
 static uint32_t rd32le(const uint8_t *p)
