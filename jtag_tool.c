@@ -19,7 +19,7 @@
  *   ./jtag_tool --serve        # 网络服务器（swo_web GUI 后端）：
  *                              #   命令口 :5555（行文本 + Z<seq>D 标记应答）
  *                              #   SWO 流口 :5556（原始字节直推）
- * 选项: --base 0x43C00000 --speed 1000 --dev /dev/mem --axi-hz 125000000 --ap 0
+ * 选项: --base 0x43C00000 --speed 10000 --dev /dev/mem --axi-hz 125000000 --ap 0
  */
 
 #include <stdio.h>
@@ -3864,7 +3864,7 @@ int main(int argc, char **argv)
     const char *dev = "/dev/mem";
     uint32_t base = 0x43C00000u;
     uint32_t axi_hz = 125000000u;   /* 本板 FCLK0；VERSION 自动探测截断成 124M */
-    int speed = 1000, apsel = 0;
+    int speed = 10000, apsel = 0;
     int serve_port = 0;
     int use_swd = 0;
     const char *ccmds[64];
@@ -3892,7 +3892,7 @@ int main(int argc, char **argv)
             ccmds[ncc++] = argv[++i];
         else {
             fprintf(stderr,
-                    "用法: %s [--base 0x43C00000] [--speed 1000] [--dev /dev/mem]"
+                    "用法: %s [--base 0x43C00000] [--speed 10000] [--dev /dev/mem]"
                     " [--axi-hz 125000000] [--ap 0] [--serve [port]] [-c CMD]...\n"
                     "  --serve [port]  网络服务器模式：命令口 port(默认5555) + SWO 流口 port+1\n",
                     argv[0]);
