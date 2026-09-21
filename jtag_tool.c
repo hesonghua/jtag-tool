@@ -2549,14 +2549,13 @@ static int spi_xfer(int fd, const uint8_t *tx, uint8_t *rx, int len)
     return ioctl(fd, SPI_IOC_MESSAGE(1), &x) < 1 ? -1 : 0;
 }
 
-static void cmd_vref(shell_t *sh, int argc, char **argv)
+/* 读 Vref，返回 mV；失败 -1（err() 已报具体原因）。cmd_vref 和 BIN_VREF 共用 */
+static int vref_read_mv(const char *dev)
 {
-    (void)sh;
-    const char *dev = argc >= 2 ? argv[1] : "/dev/spidev0.0";
     int fd = open(dev, O_RDWR);
     if (fd < 0) {
         err("打不开 %s（SPI 驱动/spidev 没起来？）", dev);
-        return;
+        return -1;
     }
     uint8_t mode = SPI_MODE_3;
     ioctl(fd, SPI_IOC_WR_MODE, &mode);
@@ -2567,26 +2566,35 @@ static void cmd_vref(shell_t *sh, int argc, char **argv)
         if (spi_xfer(fd, cmd, dummy, 8) < 0) {
             err("SPI 传输失败");
             close(fd);
-            return;
+            return -1;
         }
         usleep(2000);                       /* 从机装应答帧的余量 */
         uint8_t resp[16] = { 0 };
         if (spi_xfer(fd, resp, resp, 16) < 0) {
             err("SPI 传输失败");
             close(fd);
-            return;
+            return -1;
         }
         if (resp[0] == VREF_RESP_MAGIC && resp[1] == VREF_CMD_GET_VREF &&
             resp[2] == seq && resp[3] == 0) {
             uint32_t mv = resp[4] | resp[5] << 8 | resp[6] << 16 |
                           (uint32_t)resp[7] << 24;
-            printf("vref = %u.%03u V\n", mv / 1000, mv % 1000);
             close(fd);
-            return;
+            return (int)mv;
         }
     }
     err("ESP32 未应答（检查从机固件/接线/CS）");
     close(fd);
+    return -1;
+}
+
+static void cmd_vref(shell_t *sh, int argc, char **argv)
+{
+    (void)sh;
+    const char *dev = argc >= 2 ? argv[1] : "/dev/spidev0.0";
+    int mv = vref_read_mv(dev);
+    if (mv >= 0)
+        printf("vref = %u.%03u V\n", (unsigned)mv / 1000, (unsigned)mv % 1000);
 }
 
 static void cmd_rst(shell_t *sh, int argc, char **argv)
@@ -3300,6 +3308,7 @@ static int srv_listener(int port)
 #define BIN_SWO_TPIU  0x10
 #define BIN_SWO_STAT  0x11
 #define BIN_REPROBE   0x12
+#define BIN_VREF      0x13
 #define BIN_ERR       0x7F
 #define BIN_MAXPL     4096
 
@@ -3656,6 +3665,13 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         }
         err("reprobe: 目标未应答");
         goto eio;
+    }
+    case BIN_VREF: {
+        int mv = vref_read_mv("/dev/spidev0.0");
+        if (mv < 0)
+            goto eio;
+        put32le(out, (uint32_t)mv);
+        return 4;
     }
     default:
         i = snprintf((char *)out, (size_t)max, "unknown cmd 0x%02X", cmd);
