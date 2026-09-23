@@ -2635,7 +2635,7 @@ static void cmd_la(shell_t *sh, int argc, char **argv)
     }
     if (argc >= 2 && !strcmp(argv[1], "dump")) {
         uint32_t stat = jrd(j, 0x58);
-        unsigned wr = stat >> 16, total = wr > 4096u ? 4096u : wr;
+        unsigned wr = (stat >> 12) & 0x1FFFu, total = wr > 4096u ? 4096u : wr;
         if (!total) {
             printf("LA 无样本（先 arm）\n");
             return;
@@ -2671,7 +2671,8 @@ unsigned trig_idx = (stat & 2u)
     uint32_t pin = jrd(j, 0x40) & 0xFFF;
     uint32_t stat = jrd(j, 0x58);
     printf("LA pin=0x%03X  armed=%u fired=%u done=%u wr=%u\n",
-           pin, stat & 1u, (stat >> 1) & 1u, (stat >> 2) & 1u, stat >> 16);
+           pin, stat & 1u, (stat >> 1) & 1u, (stat >> 2) & 1u,
+           (stat >> 12) & 0x1FFFu);
 }
 
 static void cmd_rst(shell_t *sh, int argc, char **argv)
@@ -3775,7 +3776,7 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         if (n == 0 || n * 2u > (unsigned)max)
             goto etoolong;
         uint32_t stat = jrd(&sh->jtag, 0x58);
-        unsigned wr = stat >> 16;                          /* 总写入（饱和 4096） */
+        unsigned wr = (stat >> 12) & 0x1FFFu;  /* RTL 位段 [24:12]，原 >>16 错位成 /16 */
         uint32_t post = jrd(&sh->jtag, 0x54) & 0xFFFF;
         unsigned total = wr > 4096u ? 4096u : wr;
         if (total == 0)
