@@ -2597,6 +2597,83 @@ static void cmd_vref(shell_t *sh, int argc, char **argv)
         printf("vref = %u.%03u V\n", (unsigned)mv / 1000, (unsigned)mv % 1000);
 }
 
+/* ---- LA 逻辑分析器（IP VERSION >= 0x0005，12 路 la_in）----
+ * la                    状态：实时电平/armed/fired/done/写入数
+ * la cfg <div> <post> <mode> <val> <mask>   分频/触发后样本/模式(0码型1边沿)
+ * la arm / la stop      武装（清状态开始预触发环采）/ 停止
+ * la dump [n]           触发对齐读出 n 样本（默认 64，0=全部已采）
+ */
+static void cmd_la(shell_t *sh, int argc, char **argv)
+{
+    jtag_t *j = &sh->jtag;
+    if (argc >= 2 && !strcmp(argv[1], "cfg") && argc >= 7) {
+        jwr(j, 0x48, (uint32_t)parse_num(argv[5]) & 0xFFF);
+        jwr(j, 0x4C, (uint32_t)parse_num(argv[6]) & 0xFFF);
+        jwr(j, 0x50, (uint32_t)parse_num(argv[2]) & 0xFFFF);
+        jwr(j, 0x54, (uint32_t)parse_num(argv[3]) & 0xFFFF);
+        jwr(j, 0x44, ((uint32_t)parse_num(argv[4]) & 1u) << 1);
+        printf("LA cfg: div=%s post=%s mode=%s val=0x%03llX mask=0x%03llX\n",
+               argv[2], argv[3], parse_num(argv[4]) ? "edge" : "pattern",
+               parse_num(argv[5]), parse_num(argv[6]));
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "arm")) {
+        jwr(j, 0x44, jrd(j, 0x44) | 1u);   /* arm 沿（保留 mode 位） */
+        printf("LA armed\n");
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "stop")) {
+        jwr(j, 0x44, 0);
+        printf("LA stopped/cleared\n");
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "rd") && argc >= 3) {
+        /* 裸回读 LA 寄存器（诊断）：la rd 0x44 */
+        uint32_t off = (uint32_t)parse_num(argv[2]);
+        printf("LA[%03X] = 0x%08X\n", off, jrd(j, off));
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "dump")) {
+        uint32_t stat = jrd(j, 0x58);
+        unsigned wr = stat >> 16, total = wr > 4096u ? 4096u : wr;
+        if (!total) {
+            printf("LA 无样本（先 arm）\n");
+            return;
+        }
+        uint32_t post = jrd(j, 0x54) & 0xFFFF;
+        unsigned n = argc >= 3 ? (unsigned)parse_num(argv[2]) : 64;
+        if (!n || n > total)
+            n = total;
+        /* 触发样本时间序序号 wr-1-post：环未回绕即 BRAM index；预触发
+         * 不足（<0）从 0。饱和(wr=4096)时 wr≡wr_ptr 同式。 */
+unsigned trig_idx = (stat & 2u)
+            ? (unsigned)(((int)wr - 1 - (int)post) < 0
+                         ? 0 : ((int)wr - 1 - (int)post)) & 4095u
+            : 0u;
+        jwr(j, 0x5C, trig_idx);
+        (void)jrd(j, 0x60);  /* 充读管线（BRAM 注册读 1 拍），丢弃首个 */
+        printf("stat=0x%08X wr=%u trig@%u（armed=%u fired=%u done=%u）\n",
+               stat, wr, trig_idx, stat & 1u, (stat >> 1) & 1u,
+               (stat >> 2) & 1u);
+        for (unsigned k = 0; k < n; k++) {
+            if (k % 8 == 0)
+                printf("%6u: ", trig_idx + k > 4095u ? trig_idx + k - 4096u
+                                                     : trig_idx + k);
+            uint32_t v = jrd(j, 0x60);
+            printf("%03X ", v & 0xFFF);
+            if (k % 8 == 7)
+                printf("\n");
+        }
+        if (n % 8)
+            printf("\n");
+        return;
+    }
+    uint32_t pin = jrd(j, 0x40) & 0xFFF;
+    uint32_t stat = jrd(j, 0x58);
+    printf("LA pin=0x%03X  armed=%u fired=%u done=%u wr=%u\n",
+           pin, stat & 1u, (stat >> 1) & 1u, (stat >> 2) & 1u, stat >> 16);
+}
+
 static void cmd_rst(shell_t *sh, int argc, char **argv)
 {
     if (argc < 2) {
@@ -3090,6 +3167,7 @@ static const cmd_ent_t cmds[] = {
     { "chain", cmd_chain, G_GEN },
     { "speed", cmd_speed, G_GEN },
     { "vref", cmd_vref, G_GEN },
+    { "la", cmd_la, G_GEN },
     { "rst", cmd_rst, G_GEN },
     { "reset", cmd_reset, G_GEN },
     { "swo", cmd_swo, G_GEN },
@@ -3309,6 +3387,9 @@ static int srv_listener(int port)
 #define BIN_SWO_STAT  0x11
 #define BIN_REPROBE   0x12
 #define BIN_VREF      0x13
+#define BIN_LA_ARM    0x14
+#define BIN_LA_STAT   0x15
+#define BIN_LA_DUMP   0x16
 #define BIN_ERR       0x7F
 #define BIN_MAXPL     16384
 
@@ -3670,6 +3751,52 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         }
         err("reprobe: 目标未应答");
         goto eio;
+    }
+    case BIN_LA_ARM: {
+        /* [div:2][post:2][mode:1][val:2][mask:2]（全 LE）；武装并立即返回 */
+        if (len < 9)
+            goto elen;
+        jwr(&sh->jtag, 0x48, rd32le(p + 4) & 0xFFF);       /* TRIGV */
+        jwr(&sh->jtag, 0x4C, rd32le(p + 7) & 0xFFF);       /* TRIGM */
+        jwr(&sh->jtag, 0x50, rd32le(p));                   /* DIV */
+        jwr(&sh->jtag, 0x54, rd32le(p + 2));               /* POST */
+        jwr(&sh->jtag, 0x44, (p[6] ? 2u : 0u) | 1u);       /* CTRL: mode|arm */
+        return 0;
+    }
+    case BIN_LA_STAT: {
+        put32le(out, jrd(&sh->jtag, 0x58));                /* LA_STAT 原文 */
+        return 4;
+    }
+    case BIN_LA_DUMP: {
+        /* [n:2] -> n×2B：低 12bit 样本，触发对齐时间序（含触发样本开头） */
+        if (len < 2)
+            goto elen;
+        unsigned n = (unsigned)p[0] | ((unsigned)p[1] << 8);
+        if (n == 0 || n * 2u > (unsigned)max)
+            goto etoolong;
+        uint32_t stat = jrd(&sh->jtag, 0x58);
+        unsigned wr = stat >> 16;                          /* 总写入（饱和 4096） */
+        uint32_t post = jrd(&sh->jtag, 0x54) & 0xFFFF;
+        unsigned total = wr > 4096u ? 4096u : wr;
+        if (total == 0)
+            goto eio;                                      /* 没采到任何样本 */
+        if (n > total)
+            n = total;
+        /* 触发样本时间序序号 wr-1-post：环未回绕即 BRAM index；预触发
+         * 不足（<0）从 0。饱和(wr=4096)时 wr≡wr_ptr 同式。未触发从 0。 */
+unsigned trig_idx = (stat & 2u)
+            ? (unsigned)(((int)wr - 1 - (int)post) < 0
+                         ? 0 : ((int)wr - 1 - (int)post)) & 4095u
+            : 0u;
+        jwr(&sh->jtag, 0x5C, trig_idx);
+        (void)jrd(&sh->jtag, 0x60);   /* 充读管线，丢弃首个 */
+        for (unsigned k = 0; k < n; k++) {
+            uint32_t v = jrd(&sh->jtag, 0x60);             /* 读后自增 */
+            out[k * 2] = (uint8_t)(v & 0xFF);
+            out[k * 2 + 1] = (uint8_t)((v >> 8) & 0x0F);
+        }
+        put32le(out + n * 2, stat);                        /* 尾部带 STAT */
+        return (int)(n * 2 + 4);
     }
     case BIN_VREF: {
         int mv = vref_read_mv("/dev/spidev0.0");
