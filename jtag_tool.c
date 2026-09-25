@@ -2627,6 +2627,37 @@ static void cmd_la(shell_t *sh, int argc, char **argv)
         printf("LA stopped/cleared\n");
         return;
     }
+    if (argc >= 2 && !strcmp(argv[1], "stream") && argc >= 3) {
+        /* la stream <div>：流式武装（触发仅标记不停采） */
+        jwr(j, 0x50, (uint32_t)parse_num(argv[2]) & 0xFFFF);
+        jwr(j, 0x44, 0x4);               /* STREAM=1（mode 码型） */
+        jwr(j, 0x44, 0x5);               /* arm（带 STREAM） */
+        printf("LA streaming @ div=%s（'la sread <n>' 排水，'la sstop' 停）\n", argv[2]);
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "sread") && argc >= 3) {
+        unsigned want = (unsigned)parse_num(argv[2]);
+        unsigned got = 0;
+        while (got < want) {
+            uint32_t v = jrd(j, 0x64);   /* 弹 2 样本 */
+            printf("%03X %03X ", v & 0xFFF, (v >> 16) & 0xFFF);
+            got += 2;
+            if ((got % 16) == 0)
+                printf("\n");
+            uint32_t st = jrd(j, 0x68);
+            if ((st & 0xFFF) < 2)        /* FIFO 空 */
+                break;
+        }
+        printf("\n（%u 样本）\n", got);
+        return;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "sstop")) {
+        jwr(j, 0x44, 0x0);
+        uint32_t st = jrd(j, 0x68);
+        printf("LA stream 停止。OVR=%u scnt=%u 剩余=%u\n",
+               (st >> 16) & 1, jrd(j, 0x6C), st & 0xFFF);
+        return;
+    }
     if (argc >= 2 && !strcmp(argv[1], "rd") && argc >= 3) {
         /* 裸回读 LA 寄存器（诊断）：la rd 0x44 */
         uint32_t off = (uint32_t)parse_num(argv[2]);
@@ -3391,6 +3422,7 @@ static int srv_listener(int port)
 #define BIN_LA_ARM    0x14
 #define BIN_LA_STAT   0x15
 #define BIN_LA_DUMP   0x16
+#define BIN_LA_SREAD  0x17
 #define BIN_ERR       0x7F
 #define BIN_MAXPL     16384
 
@@ -3754,14 +3786,23 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         goto eio;
     }
     case BIN_LA_ARM: {
-        /* [div:2][post:2][mode:1][val:2][mask:2]（全 LE）；武装并立即返回 */
+        /* [div:2][post:2][mode:1][val:2][mask:2]（全 LE）；武装并立即返回。
+         * post 的 bit15 = STREAM（v6）：置位走流式（采样进 1024 FIFO 持续
+         * 排水，触发仅标记，POST 无意义），CTRL 写 4（STREAM）再写 5（arm）。 */
         if (len < 9)
             goto elen;
+        uint32_t post = rd32le(p + 2);
+        int stream = (post >> 15) & 1u;
         jwr(&sh->jtag, 0x48, rd32le(p + 4) & 0xFFF);       /* TRIGV */
         jwr(&sh->jtag, 0x4C, rd32le(p + 7) & 0xFFF);       /* TRIGM */
         jwr(&sh->jtag, 0x50, rd32le(p));                   /* DIV */
-        jwr(&sh->jtag, 0x54, rd32le(p + 2));               /* POST */
-        jwr(&sh->jtag, 0x44, (p[6] ? 2u : 0u) | 1u);       /* CTRL: mode|arm */
+        if (stream) {
+            jwr(&sh->jtag, 0x44, 0x4u);                    /* STREAM=1 */
+            jwr(&sh->jtag, 0x44, 0x5u);                    /* arm（带 STREAM） */
+        } else {
+            jwr(&sh->jtag, 0x54, post & 0x7FFF);           /* POST（去 bit15） */
+            jwr(&sh->jtag, 0x44, (p[6] ? 2u : 0u) | 1u);   /* CTRL: mode|arm */
+        }
         return 0;
     }
     case BIN_LA_STAT: {
@@ -3798,6 +3839,32 @@ unsigned trig_idx = (stat & 2u)
         }
         put32le(out + n * 2, stat);                        /* 尾部带 STAT */
         return (int)(n * 2 + 4);
+    }
+    case BIN_LA_SREAD: {
+        /* [n:2] -> min(n, FIFO 积压) 样本 + 尾 4B SSTAT。want 钳到当前
+         * FIFO 计数（读空后 0x64 弹不出新样本只会重复旧值=垃圾数据，
+         * 且空转循环阻塞 serve 的 SWO 排水）。一帧最多弹 1024。 */
+        if (len < 2)
+            goto elen;
+        unsigned want = (unsigned)p[0] | ((unsigned)p[1] << 8);
+        uint32_t s0 = jrd(&sh->jtag, 0x68);
+        unsigned avail = s0 & 0xFFF;
+        if (want > avail)
+            want = avail;             /* 钳到实际积压（0 也合法=空帧） */
+        if (want * 2u + 4u > (unsigned)max)
+            goto etoolong;
+        unsigned k;
+        for (k = 0; k + 1 < want; k += 2) {
+            uint32_t v = jrd(&sh->jtag, 0x64);
+            out[k]      = (uint8_t)(v & 0xFF);
+            out[k + 1]  = (uint8_t)((v >> 8) & 0x0F);
+            if (k + 3 < want) {
+                out[k + 2] = (uint8_t)((v >> 16) & 0xFF);
+                out[k + 3] = (uint8_t)((v >> 24) & 0x0F);
+            }
+        }
+        put32le(out + want * 2u, jrd(&sh->jtag, 0x68));
+        return (int)(want * 2u + 4u);
     }
     case BIN_VREF: {
         int mv = vref_read_mv("/dev/spidev0.0");
