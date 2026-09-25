@@ -2666,7 +2666,10 @@ static void cmd_la(shell_t *sh, int argc, char **argv)
     }
     if (argc >= 2 && !strcmp(argv[1], "dump")) {
         uint32_t stat = jrd(j, 0x58);
-        unsigned wr = (stat >> 12) & 0x1FFFu, total = wr > 4096u ? 4096u : wr;
+        unsigned wr = (stat >> 15) & 0x3FFFu;  /* v7 [28:15] 14bit 饱和 */
+        if (stat & (1u << 29))
+            wr = 32768u;                      /* sat：写满深 */
+        unsigned total = wr > 32768u ? 32768u : wr;
         if (!total) {
             printf("LA 无样本（先 arm）\n");
             return;
@@ -2679,7 +2682,7 @@ static void cmd_la(shell_t *sh, int argc, char **argv)
          * 不足（<0）从 0。饱和(wr=4096)时 wr≡wr_ptr 同式。 */
 unsigned trig_idx = (stat & 2u)
             ? (unsigned)(((int)wr - 1 - (int)post) < 0
-                         ? 0 : ((int)wr - 1 - (int)post)) & 4095u
+                         ? 0 : ((int)wr - 1 - (int)post)) & 32767u
             : 0u;
         jwr(j, 0x5C, trig_idx);
         (void)jrd(j, 0x60);  /* 充读管线（BRAM 注册读 1 拍），丢弃首个 */
@@ -2703,7 +2706,7 @@ unsigned trig_idx = (stat & 2u)
     uint32_t stat = jrd(j, 0x58);
     printf("LA pin=0x%03X  armed=%u fired=%u done=%u wr=%u\n",
            pin, stat & 1u, (stat >> 1) & 1u, (stat >> 2) & 1u,
-           (stat >> 12) & 0x1FFFu);
+           ((stat & (1u << 29)) ? 32768u : ((stat >> 15) & 0x3FFFu));
 }
 
 static void cmd_rst(shell_t *sh, int argc, char **argv)
@@ -3792,7 +3795,9 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         if (len < 9)
             goto elen;
         uint32_t post = rd32le(p + 2);
-        int stream = (post >> 15) & 1u;
+        int stream = (post >> 31) & 1u;   /* bit31=STREAM（bit15 会撞
+                                              post>32767 的正常值，50k 样本
+                                              曾被误判流式 → 环形没配 → DUMP eio） */
         jwr(&sh->jtag, 0x48, rd32le(p + 4) & 0xFFF);       /* TRIGV */
         jwr(&sh->jtag, 0x4C, rd32le(p + 7) & 0xFFF);       /* TRIGM */
         jwr(&sh->jtag, 0x50, rd32le(p));                   /* DIV */
@@ -3806,7 +3811,13 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         return 0;
     }
     case BIN_LA_STAT: {
-        put32le(out, jrd(&sh->jtag, 0x58));                /* LA_STAT 原文 */
+        {
+            uint32_t s = jrd(&sh->jtag, 0x58);
+            unsigned c = (s >> 15) & 0x3FFFu;
+            if (s & (1u << 29))
+                c = 32768u;
+            put32le(out, (s & 0x2007u) | (c << 15));   /* sat 展开成满深 */
+        }
         return 4;
     }
     case BIN_LA_DUMP: {
@@ -3817,9 +3828,11 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
         if (n == 0 || n * 2u > (unsigned)max)
             goto etoolong;
         uint32_t stat = jrd(&sh->jtag, 0x58);
-        unsigned wr = (stat >> 12) & 0x1FFFu;  /* RTL 位段 [24:12]，原 >>16 错位成 /16 */
+        unsigned wr = (stat >> 15) & 0x3FFFu;  /* v7 [28:15] 14bit 饱和 */
+        if (stat & (1u << 29))
+            wr = 32768u;
         uint32_t post = jrd(&sh->jtag, 0x54) & 0xFFFF;
-        unsigned total = wr > 4096u ? 4096u : wr;
+        unsigned total = wr > 32768u ? 32768u : wr;
         if (total == 0)
             goto eio;                                      /* 没采到任何样本 */
         if (n > total)
@@ -3828,7 +3841,7 @@ static int srv_binary(shell_t *sh, uint8_t cmd, const uint8_t *p, int len,
          * 不足（<0）从 0。饱和(wr=4096)时 wr≡wr_ptr 同式。未触发从 0。 */
 unsigned trig_idx = (stat & 2u)
             ? (unsigned)(((int)wr - 1 - (int)post) < 0
-                         ? 0 : ((int)wr - 1 - (int)post)) & 4095u
+                         ? 0 : ((int)wr - 1 - (int)post)) & 32767u
             : 0u;
         jwr(&sh->jtag, 0x5C, trig_idx);
         (void)jrd(&sh->jtag, 0x60);   /* 充读管线，丢弃首个 */
